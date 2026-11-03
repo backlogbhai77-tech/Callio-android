@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
     private var callClient: AudioCallClient? = null
     private var ringtone: Ringtone? = null
     private var pendingIncomingId: String? = null
+    private var pendingAutoAcceptCallId: String? = null
     private var lastIncomingNotificationId: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var ringTimeout: Runnable? = null
@@ -146,6 +147,7 @@ class MainActivity : ComponentActivity() {
             client.onError = { message -> runOnUiThread { showMessage(message); client.end("failed"); finishLocalCall() } }
             client.onCallCreated = { id -> repository.notifyCallServer(id) { error -> if (error != null) showMessage("Call started; push alert issue: $error") } }
         }
+        maybeAutoAcceptIncomingCall()
     }
 
     private fun startCall(friend: CallioFriend) {
@@ -215,18 +217,33 @@ class MainActivity : ComponentActivity() {
     private fun stopRingtone() { try { ringtone?.stop() } catch (_: Exception) { }; ringtone = null }
 
     private fun handleCallIntent(intent: Intent?) {
-        if (intent?.action != ACTION_OPEN_INCOMING) return
+        val action = intent?.action
+        if (action != ACTION_OPEN_INCOMING && action != ACTION_ACCEPT_INCOMING) return
         val id = intent.getStringExtra(EXTRA_CALL_ID) ?: return
         pendingIncomingId = id
+        pendingAutoAcceptCallId = if (action == ACTION_ACCEPT_INCOMING) id else null
         if (currentUser != null) loadIncomingFromNotification(id)
     }
 
     private fun loadIncomingFromNotification(id: String) {
         repository.fetchIncomingCall(id) { call -> runOnUiThread {
             pendingIncomingId = null
-            if (call != null) { incomingCall = call; startRingtone() }
-            else showMessage("This call is no longer available")
+            if (call != null) {
+                incomingCall = call
+                if (pendingAutoAcceptCallId == id) maybeAutoAcceptIncomingCall() else startRingtone()
+            } else {
+                pendingAutoAcceptCallId = null
+                showMessage("This call is no longer available")
+            }
         } }
+    }
+
+    private fun maybeAutoAcceptIncomingCall() {
+        val expectedId = pendingAutoAcceptCallId ?: return
+        val call = incomingCall ?: return
+        if (call.id != expectedId || callClient == null) return
+        pendingAutoAcceptCallId = null
+        mainHandler.post { acceptIncomingCall() }
     }
 
     private fun hasMicrophonePermission() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -247,6 +264,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val ACTION_OPEN_INCOMING = "com.callio.app.OPEN_INCOMING_CALL"
+        const val ACTION_ACCEPT_INCOMING = "com.callio.app.ACCEPT_INCOMING_CALL"
         const val EXTRA_CALL_ID = "callio_call_id"
         const val EXTRA_CALLER_NAME = "callio_caller_name"
         private const val REQUEST_MIC = 41
