@@ -51,14 +51,29 @@ class CallioMessagingService : FirebaseMessagingService() {
             }
         }
 
-        val answerIntent = Intent(this, MainActivity::class.java).apply {
-            action = MainActivity.ACTION_OPEN_INCOMING
+        // Full-screen notification opens a dedicated lock-screen call UI.
+        val fullScreenIntent = Intent(this, com.callio.app.IncomingCallActivity::class.java).apply {
+            action = ACTION_SHOW_INCOMING_CALL
             putExtra(MainActivity.EXTRA_CALL_ID, callId)
             putExtra(MainActivity.EXTRA_CALLER_NAME, callerName)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
-        val answerPending = PendingIntent.getActivity(this, callId.hashCode(), answerIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val fullScreenPending = PendingIntent.getActivity(
+            this, callId.hashCode(), fullScreenIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Notification's Answer action goes to MainActivity with an explicit auto-answer request.
+        val answerIntent = Intent(this, MainActivity::class.java).apply {
+            action = MainActivity.ACTION_ACCEPT_INCOMING
+            putExtra(MainActivity.EXTRA_CALL_ID, callId)
+            putExtra(MainActivity.EXTRA_CALLER_NAME, callerName)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val answerPending = PendingIntent.getActivity(
+            this, callId.hashCode() + 2, answerIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         val declineIntent = Intent(this, CallActionReceiver::class.java).apply {
             action = CallActionReceiver.ACTION_DECLINE
@@ -78,8 +93,8 @@ class CallioMessagingService : FirebaseMessagingService() {
             .setOngoing(true)
             .setTimeoutAfter(45_000L)
             .setAutoCancel(false)
-            .setFullScreenIntent(answerPending, true)
-            .setContentIntent(answerPending)
+            .setFullScreenIntent(fullScreenPending, true)
+            .setContentIntent(fullScreenPending)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setStyle(Notification.CallStyle.forIncomingCall(person, declinePending, answerPending))
@@ -90,5 +105,10 @@ class CallioMessagingService : FirebaseMessagingService() {
         NotificationManagerCompat.from(this).notify(callId.hashCode(), builder.build())
     }
 
-    companion object { const val CHANNEL_ID = "callio_incoming_calls_v1" }
+    companion object {
+        // v2 forces Android to create a fresh high-importance channel after upgrading
+        // from the earlier build whose notification channel settings are already stored.
+        const val CHANNEL_ID = "callio_incoming_calls_v2"
+        const val ACTION_SHOW_INCOMING_CALL = "com.callio.app.SHOW_INCOMING_CALL"
+    }
 }
