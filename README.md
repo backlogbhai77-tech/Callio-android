@@ -1,5 +1,15 @@
 
-# Callio Native Android 1.0 — Starter Build
+
+## Update included in this ZIP (3 November 2026)
+
+- Rebuilt the signed-in experience with a clear bottom navigation: Home, Friends, Requests and Profile.
+- Moved profile editing out of the main dashboard so the friends list has room to breathe.
+- Added a dedicated friend search/filter and cleaner friend cards with a one-tap audio-call action.
+- Improved friend loading to merge accepted relationships from `friendships` and accepted `friendRequests` in either direction. This supports both relationship records without changing or migrating Firestore data.
+- Preserved the existing Firebase configuration, ringtone, package name, authentication flow and WebRTC calling files.
+
+**Build verification:** The source has been updated, but this environment does not have Gradle or Android SDK available, so a fresh APK build has not been run here. Use the included GitHub Actions workflow to compile it; if it reports an error, share the build log text and I can correct it. This is not yet a production-certified calling release.
+# Callio Native Android — UI & Friends Refresh
 
 A separate Kotlin + Jetpack Compose Android app for the existing Callio Firebase project. The existing Next.js PWA is not modified by this project. The Android app reuses the same Firebase Authentication users and Firestore collections.
 
