@@ -90,34 +90,115 @@ class CallioRepository {
         }.addOnFailureListener { done(it.localizedMessage ?: "Could not authenticate push request") }
     }
 
+    /**
+     * Listen to both friendship documents and accepted friend-request documents.
+     * Older Callio web builds may have one representation but not the other, so
+     * merge both sources instead of silently showing an empty friends list.
+     */
     fun listenFriends(uid: String, callback: (List<CallioFriend>) -> Unit, error: (String) -> Unit): ListenerRegistration {
-        return db.collection("friendships").whereArrayContains("memberUids", uid).limit(100)
-            .addSnapshotListener { snapshot, exception ->
-                if (exception != null) { error(exception.localizedMessage ?: "Friends unavailable"); return@addSnapshotListener }
-                if (snapshot == null) return@addSnapshotListener
-                val records = snapshot.documents
-                if (records.isEmpty()) { callback(emptyList()); return@addSnapshotListener }
-                val friends = mutableListOf<CallioFriend>()
-                var pending = records.size
-                records.forEach { friendship ->
-                    val members = friendship.get("memberUids") as? List<*> ?: emptyList<Any>()
-                    val otherUid = members.filterIsInstance<String>().firstOrNull { it != uid }
-                    if (otherUid == null) {
-                        pending--; if (pending == 0) callback(friends.sortedBy { it.displayName.lowercase() })
-                    } else {
-                        db.collection("users").document(otherUid).get().addOnSuccessListener { profile ->
-                            if (profile.exists()) friends.add(CallioFriend(
-                                uid = otherUid,
-                                displayName = profile.getString("displayName") ?: "Callio friend",
+        val lock = Any()
+        val friendshipRows = linkedMapOf<String, String>()
+        val acceptedRows = linkedMapOf<String, String>()
+        var friendshipSnapshotReady = false
+        var outgoingSnapshotReady = false
+        var incomingSnapshotReady = false
+
+        fun publish() {
+            val merged = synchronized(lock) {
+                (acceptedRows + friendshipRows).toMap()
+            }
+            if (!friendshipSnapshotReady && !outgoingSnapshotReady && !incomingSnapshotReady) return
+            if (merged.isEmpty()) {
+                callback(emptyList())
+                return
+            }
+            val result = java.util.concurrent.ConcurrentHashMap<String, CallioFriend>()
+            val remaining = java.util.concurrent.atomic.AtomicInteger(merged.size)
+            merged.forEach { (friendUid, friendshipId) ->
+                db.collection("users").document(friendUid).get()
+                    .addOnSuccessListener { profile ->
+                        if (profile.exists()) {
+                            result[friendUid] = CallioFriend(
+                                uid = friendUid,
+                                displayName = profile.getString("displayName")
+                                    ?: profile.getString("name")
+                                    ?: "Callio friend",
                                 username = profile.getString("username") ?: "",
-                                friendshipId = friendship.id
-                            ))
-                        }.addOnCompleteListener {
-                            pending--; if (pending == 0) callback(friends.sortedBy { it.displayName.lowercase() })
+                                friendshipId = friendshipId
+                            )
                         }
                     }
+                    .addOnFailureListener { /* Keep other friends visible if one profile is private/unavailable. */ }
+                    .addOnCompleteListener {
+                        if (remaining.decrementAndGet() == 0) {
+                            callback(result.values.sortedBy { it.displayName.lowercase() })
+                        }
+                    }
+            }
+        }
+
+        val friendshipListener = db.collection("friendships")
+            .whereArrayContains("memberUids", uid)
+            .limit(100)
+            .addSnapshotListener { snapshot, exception ->
+                if (exception != null) error(exception.localizedMessage ?: "Friends unavailable")
+                if (snapshot != null) {
+                    synchronized(lock) {
+                        friendshipRows.clear()
+                        snapshot.documents.forEach { doc ->
+                            val members = doc.get("memberUids") as? List<*> ?: emptyList<Any>()
+                            val otherUid = members.filterIsInstance<String>().firstOrNull { it != uid }
+                            if (!otherUid.isNullOrBlank()) friendshipRows[otherUid] = doc.id
+                        }
+                        friendshipSnapshotReady = true
+                    }
+                    publish()
                 }
             }
+
+        val outgoingListener = db.collection("friendRequests")
+            .whereEqualTo("fromUid", uid)
+            .limit(100)
+            .addSnapshotListener { snapshot, exception ->
+                if (exception != null) error(exception.localizedMessage ?: "Accepted friends unavailable")
+                if (snapshot != null) {
+                    synchronized(lock) {
+                        acceptedRows.entries.removeAll { it.value.startsWith("out:") }
+                        snapshot.documents.filter { it.getString("status") == "accepted" }.forEach { doc ->
+                            val otherUid = doc.getString("toUid").orEmpty()
+                            if (otherUid.isNotBlank()) acceptedRows[otherUid] = "out:${doc.id}"
+                        }
+                        outgoingSnapshotReady = true
+                    }
+                    publish()
+                }
+            }
+
+        val incomingListener = db.collection("friendRequests")
+            .whereEqualTo("toUid", uid)
+            .limit(100)
+            .addSnapshotListener { snapshot, exception ->
+                if (exception != null) error(exception.localizedMessage ?: "Accepted friends unavailable")
+                if (snapshot != null) {
+                    synchronized(lock) {
+                        acceptedRows.entries.removeAll { it.value.startsWith("in:") }
+                        snapshot.documents.filter { it.getString("status") == "accepted" }.forEach { doc ->
+                            val otherUid = doc.getString("fromUid").orEmpty()
+                            if (otherUid.isNotBlank()) acceptedRows[otherUid] = "in:${doc.id}"
+                        }
+                        incomingSnapshotReady = true
+                    }
+                    publish()
+                }
+            }
+
+        return object : ListenerRegistration {
+            override fun remove() {
+                friendshipListener.remove()
+                outgoingListener.remove()
+                incomingListener.remove()
+            }
+        }
     }
 
     fun searchUsername(username: String, done: (CallioFriend?, String?) -> Unit) {
