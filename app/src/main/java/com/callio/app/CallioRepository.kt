@@ -8,6 +8,9 @@ import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
 import com.google.firebase.messaging.FirebaseMessaging
 
+private const val RING_WINDOW_MS = 90_000L          // a ringing call older than this is stale
+private const val STALE_CONNECTED_MS = 3L * 60 * 60 * 1000 // "connected" for 3h+ with no end = orphaned
+
 class CallioRepository {
     private val auth = FirebaseAuth.getInstance()
     private val db = FirebaseFirestore.getInstance()
@@ -232,11 +235,24 @@ class CallioRepository {
         }.addOnSuccessListener { done(null) }.addOnFailureListener { done(it.localizedMessage ?: "Could not send friend request") }
     }
 
-    fun listenIncomingRequests(uid: String, callback: (List<Pair<String, String>>) -> Unit): ListenerRegistration {
+    fun listenIncomingRequests(uid: String, callback: (List<FriendRequestItem>) -> Unit): ListenerRegistration {
         return db.collection("friendRequests").whereEqualTo("toUid", uid).limit(30)
             .addSnapshotListener { snapshot, _ ->
-                val rows = snapshot?.documents?.filter { it.getString("status") == "pending" }?.map { it.id to (it.getString("fromUid") ?: "") } ?: emptyList()
-                callback(rows)
+                val docs = snapshot?.documents?.filter { it.getString("status") == "pending" } ?: emptyList()
+                if (docs.isEmpty()) { callback(emptyList()); return@addSnapshotListener }
+                val results = java.util.concurrent.ConcurrentHashMap<String, FriendRequestItem>()
+                val remaining = java.util.concurrent.atomic.AtomicInteger(docs.size)
+                docs.forEach { doc ->
+                    val from = doc.getString("fromUid").orEmpty()
+                    db.collection("users").document(from).get()
+                        .addOnSuccessListener { p ->
+                            results[doc.id] = FriendRequestItem(doc.id, from, p.getString("displayName") ?: "Callio member", p.getString("username") ?: "")
+                        }
+                        .addOnFailureListener { results[doc.id] = FriendRequestItem(doc.id, from, "Callio member", "") }
+                        .addOnCompleteListener {
+                            if (remaining.decrementAndGet() == 0) callback(docs.mapNotNull { results[it.id] })
+                        }
+                }
             }
     }
 
@@ -253,30 +269,88 @@ class CallioRepository {
         }.addOnSuccessListener { done(null) }.addOnFailureListener { done(it.localizedMessage) }
     }
 
+    private fun createdMillis(doc: com.google.firebase.firestore.DocumentSnapshot): Long? =
+        doc.getTimestamp("createdAt")?.toDate()?.time
+
+    private fun toIncoming(doc: com.google.firebase.firestore.DocumentSnapshot): IncomingCall? {
+        val offer = doc.get("offer") as? Map<*, *> ?: return null
+        return IncomingCall(
+            id = doc.id,
+            callerId = doc.getString("callerId") ?: "",
+            callerName = doc.getString("callerName") ?: "Callio friend",
+            offerType = offer["type"] as? String ?: "offer",
+            offerSdp = offer["sdp"] as? String ?: ""
+        )
+    }
+
     fun listenIncomingCalls(uid: String, callback: (IncomingCall?) -> Unit): ListenerRegistration {
         return db.collection("calls").whereEqualTo("calleeId", uid).limit(50)
             .addSnapshotListener { snapshot, _ ->
-                val doc = snapshot?.documents?.firstOrNull { it.getString("status") == "ringing" }
-                val offer = doc?.get("offer") as? Map<*, *>
-                callback(if (doc == null || offer == null) null else IncomingCall(
-                    id = doc.id,
-                    callerId = doc.getString("callerId") ?: "",
-                    callerName = doc.getString("callerName") ?: "Callio friend",
-                    offerType = offer["type"] as? String ?: "offer",
-                    offerSdp = offer["sdp"] as? String ?: ""
-                ))
+                val now = System.currentTimeMillis()
+                val doc = snapshot?.documents
+                    ?.filter { it.getString("status") == "ringing" }
+                    ?.filter { d -> val c = createdMillis(d); c == null || now - c < RING_WINDOW_MS }
+                    ?.maxByOrNull { createdMillis(it) ?: Long.MAX_VALUE }
+                callback(doc?.let { toIncoming(it) })
             }
     }
 
     fun fetchIncomingCall(callId: String, done: (IncomingCall?) -> Unit) {
         db.collection("calls").document(callId).get().addOnSuccessListener { doc ->
-            val offer = doc.get("offer") as? Map<*, *>
-            done(if (!doc.exists() || offer == null || doc.getString("status") != "ringing") null else IncomingCall(
-                id = doc.id, callerId = doc.getString("callerId") ?: "",
-                callerName = doc.getString("callerName") ?: "Callio friend",
-                offerType = offer["type"] as? String ?: "offer", offerSdp = offer["sdp"] as? String ?: ""
-            ))
+            val c = createdMillis(doc)
+            val fresh = c == null || System.currentTimeMillis() - c < RING_WINDOW_MS
+            done(if (!doc.exists() || doc.getString("status") != "ringing" || !fresh) null else toIncoming(doc))
         }.addOnFailureListener { done(null) }
+    }
+
+    /** Closes calls that were orphaned (app killed / network lost mid-call) so they never ring or hang again. */
+    fun cleanupStaleCalls(uid: String) {
+        val now = System.currentTimeMillis()
+        listOf("callerId", "calleeId").forEach { field ->
+            db.collection("calls").whereEqualTo(field, uid).limit(100).get().addOnSuccessListener { snap ->
+                snap.documents.forEach { doc ->
+                    val status = doc.getString("status") ?: return@forEach
+                    val age = now - (createdMillis(doc) ?: return@forEach)
+                    val next = when {
+                        status == "ringing" && age > RING_WINDOW_MS -> "missed"
+                        status == "connected" && age > STALE_CONNECTED_MS -> "ended"
+                        else -> return@forEach
+                    }
+                    doc.reference.update(mapOf("status" to next, "endedAt" to FieldValue.serverTimestamp()))
+                }
+            }
+        }
+    }
+
+    fun listenCallHistory(uid: String, callback: (List<CallHistoryItem>) -> Unit): ListenerRegistration {
+        val lock = Any()
+        val outgoing = linkedMapOf<String, CallHistoryItem>()
+        val incoming = linkedMapOf<String, CallHistoryItem>()
+        fun publish() {
+            val merged = synchronized(lock) {
+                (outgoing.values + incoming.values).sortedByDescending { it.createdAtMillis }.take(60)
+            }
+            callback(merged)
+        }
+        fun parse(doc: com.google.firebase.firestore.DocumentSnapshot, isOutgoing: Boolean): CallHistoryItem? {
+            val status = doc.getString("status") ?: return null
+            if (status == "ringing" || status == "connected") return null
+            val otherUid = (if (isOutgoing) doc.getString("calleeId") else doc.getString("callerId")).orEmpty()
+            val name = (if (isOutgoing) doc.getString("calleeName") else doc.getString("callerName")) ?: "Callio friend"
+            val duration = (doc.get("durationSeconds") as? Number)?.toLong() ?: 0L
+            return CallHistoryItem(doc.id, otherUid, name, isOutgoing, status, createdMillis(doc) ?: System.currentTimeMillis(), duration)
+        }
+        val out = db.collection("calls").whereEqualTo("callerId", uid).limit(100).addSnapshotListener { snap, _ ->
+            if (snap == null) return@addSnapshotListener
+            synchronized(lock) { outgoing.clear(); snap.documents.forEach { d -> parse(d, true)?.let { outgoing[d.id] = it } } }
+            publish()
+        }
+        val inc = db.collection("calls").whereEqualTo("calleeId", uid).limit(100).addSnapshotListener { snap, _ ->
+            if (snap == null) return@addSnapshotListener
+            synchronized(lock) { incoming.clear(); snap.documents.forEach { d -> parse(d, false)?.let { incoming[d.id] = it } } }
+            publish()
+        }
+        return object : ListenerRegistration { override fun remove() { out.remove(); inc.remove() } }
     }
 
     fun saveUsername(username: String, displayName: String, done: (String?) -> Unit) {
