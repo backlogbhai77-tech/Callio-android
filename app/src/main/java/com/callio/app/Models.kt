@@ -1,25 +1,33 @@
-package com.callio.app.update
+package com.callio.app.data
 
-/** Parsed `version.json` published with every GitHub release. */
-data class UpdateInfo(
-    val versionCode: Long,
-    val versionName: String,
-    val apkUrl: String,
-    val sha256: String,
-    val sizeBytes: Long,
-    val type: String,
-    val minSupportedVersionCode: Long,
-    val lastMajorVersionCode: Long,
-    val notes: String
+data class CallioFriend(
+    val uid: String,
+    val displayName: String,
+    val username: String = "",
+    val friendshipId: String
 )
 
-sealed interface UpdateUiState {
-    data object Idle : UpdateUiState
-    data object Checking : UpdateUiState
-    data object UpToDate : UpdateUiState
-    data class Available(val info: UpdateInfo, val forced: Boolean, val major: Boolean) : UpdateUiState
-    data class Downloading(val info: UpdateInfo, val percent: Int) : UpdateUiState
-    data class Installing(val info: UpdateInfo) : UpdateUiState
-    data class NeedsPermission(val info: UpdateInfo) : UpdateUiState
-    data class Error(val message: String) : UpdateUiState
-}
+data class IncomingCall(
+    val id: String,
+    val callerId: String,
+    val callerName: String,
+    val offerType: String,
+    val offerSdp: String
+)
+
+data class FriendRequestItem(
+    val id: String,
+    val fromUid: String,
+    val fromName: String,
+    val fromUsername: String = ""
+)
+
+data class CallHistoryItem(
+    val id: String,
+    val otherUid: String,
+    val personName: String,
+    val outgoing: Boolean,
+    val status: String,
+    val createdAtMillis: Long,
+    val durationSeconds: Long = 0L
+)
