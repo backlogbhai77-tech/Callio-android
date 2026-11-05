@@ -63,7 +63,8 @@ jobs:
       - name: Verify signature
         run: |
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
-          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | head -n 5
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)
+          "${BT}apksigner" verify --print-certs "$APK" | head -n 5
           cp "$APK" "Callio-$VERSION_NAME.apk"
 
       - name: Write version.json
