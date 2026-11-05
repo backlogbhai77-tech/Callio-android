@@ -19,6 +19,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.CallMade
+import androidx.compose.material.icons.filled.CallMissed
+import androidx.compose.material.icons.filled.CallReceived
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Group
@@ -64,6 +69,14 @@ import androidx.compose.ui.unit.sp
 import com.callio.app.data.CallioFriend
 import com.callio.app.data.IncomingCall
 import com.google.firebase.auth.FirebaseUser
+import com.callio.app.data.CallHistoryItem
+import com.callio.app.data.FriendRequestItem
+import com.callio.app.update.UpdateUiState
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableLongStateOf
+import kotlinx.coroutines.delay
 
 private val Ink = Color(0xFF090811)
 private val Panel = Color(0xFF171522)
@@ -74,12 +87,21 @@ private val Muted = Color(0xFFAAA4B8)
 private val Mint = Color(0xFF6FE0B0)
 private val Danger = Color(0xFFFF7189)
 
+data class UpdateUiActions(
+    val onCheck: () -> Unit,
+    val onUpdateNow: () -> Unit,
+    val onDismiss: () -> Unit,
+    val onOpenInstallSettings: () -> Unit
+)
+
 @Composable
 fun CallioApp(
-    user: FirebaseUser?, savedDisplayName: String, savedUsername: String, friends: List<CallioFriend>, requests: List<Pair<String, String>>,
-    incomingCall: IncomingCall?, callState: String, callPerson: String, callMuted: Boolean, callSpeaker: Boolean,
-    toastMessage: String, onSignIn: (String, String) -> Unit, onSignUp: (String, String, String) -> Unit,
-    onSignOut: () -> Unit, onCall: (CallioFriend) -> Unit, onSearchAndAdd: (String) -> Unit,
+    user: FirebaseUser?, savedDisplayName: String, savedUsername: String, friends: List<CallioFriend>,
+    requests: List<FriendRequestItem>, history: List<CallHistoryItem>,
+    incomingCall: IncomingCall?, callState: String, callPerson: String, callMuted: Boolean, callSpeaker: Boolean, callConnectedAt: Long,
+    toastMessage: String, versionName: String, updateState: UpdateUiState, updateActions: UpdateUiActions,
+    onSignIn: (String, String) -> Unit, onSignUp: (String, String, String) -> Unit,
+    onSignOut: () -> Unit, onCall: (CallioFriend) -> Unit, onCallBack: (CallHistoryItem) -> Unit, onSearchAndAdd: (String) -> Unit,
     onAcceptRequest: (String) -> Unit, onSaveProfile: (String, String) -> Unit,
     onAcceptCall: () -> Unit, onRejectCall: () -> Unit, onEndCall: () -> Unit,
     onToggleMute: () -> Unit, onToggleSpeaker: () -> Unit, onClearMessage: () -> Unit
@@ -92,12 +114,14 @@ fun CallioApp(
             when {
                 user == null -> AuthScreen(onSignIn, onSignUp)
                 incomingCall != null && callState.isBlank() -> IncomingScreen(incomingCall, onAcceptCall, onRejectCall)
-                callState.isNotBlank() -> ActiveCallScreen(callPerson, callState, callMuted, callSpeaker, onToggleMute, onToggleSpeaker, onEndCall)
+                callState.isNotBlank() -> ActiveCallScreen(callPerson, callState, callConnectedAt, callMuted, callSpeaker, onToggleMute, onToggleSpeaker, onEndCall)
                 else -> MainShell(
-                    user, savedDisplayName, savedUsername, friends, requests, toastMessage,
-                    onSignOut, onCall, onSearchAndAdd, onAcceptRequest, onSaveProfile, onClearMessage
+                    user, savedDisplayName, savedUsername, friends, requests, history, toastMessage,
+                    versionName, updateState, updateActions,
+                    onSignOut, onCall, onCallBack, onSearchAndAdd, onAcceptRequest, onSaveProfile, onClearMessage
                 )
             }
+            UpdateDialog(updateState, updateActions)
         }
     }
 }
@@ -105,8 +129,9 @@ fun CallioApp(
 @Composable
 private fun MainShell(
     user: FirebaseUser, savedDisplayName: String, savedUsername: String,
-    friends: List<CallioFriend>, requests: List<Pair<String, String>>, toast: String,
-    onSignOut: () -> Unit, onCall: (CallioFriend) -> Unit, onSearchAndAdd: (String) -> Unit,
+    friends: List<CallioFriend>, requests: List<FriendRequestItem>, history: List<CallHistoryItem>, toast: String,
+    versionName: String, updateState: UpdateUiState, updateActions: UpdateUiActions,
+    onSignOut: () -> Unit, onCall: (CallioFriend) -> Unit, onCallBack: (CallHistoryItem) -> Unit, onSearchAndAdd: (String) -> Unit,
     onAcceptRequest: (String) -> Unit, onSaveProfile: (String, String) -> Unit, onClearMessage: () -> Unit
 ) {
     var selectedTab by remember(user.uid) { mutableIntStateOf(0) }
@@ -117,8 +142,9 @@ private fun MainShell(
                 val tabs = listOf(
                     Triple("Home", Icons.Default.Home, 0),
                     Triple("Friends", Icons.Default.Group, 1),
-                    Triple("Requests", Icons.Default.Notifications, 2),
-                    Triple("Profile", Icons.Default.Person, 3)
+                    Triple("Calls", Icons.Default.History, 2),
+                    Triple("Requests", Icons.Default.Notifications, 3),
+                    Triple("Profile", Icons.Default.Person, 4)
                 )
                 tabs.forEach { (label, icon, index) ->
                     NavigationBarItem(
@@ -147,6 +173,7 @@ private fun MainShell(
                     Text(initialOf(savedDisplayName.ifBlank { user.displayName ?: user.email ?: "C" }), color = Lavender, fontWeight = FontWeight.Bold)
                 }
             }
+            UpdateBanner(updateState)
             if (toast.isNotBlank()) {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF2B2340)),
@@ -159,8 +186,9 @@ private fun MainShell(
             when (selectedTab) {
                 0 -> HomeTab(user, friends, requests, onCall, onAcceptRequest, onGoFriends = { selectedTab = 1 })
                 1 -> FriendsTab(friends, onCall, onSearchAndAdd)
-                2 -> RequestsTab(requests, onAcceptRequest)
-                else -> ProfileTab(user, savedDisplayName, savedUsername, onSaveProfile, onSignOut)
+                2 -> CallsTab(history, onCallBack)
+                3 -> RequestsTab(requests, onAcceptRequest)
+                else -> ProfileTab(user, savedDisplayName, savedUsername, versionName, updateState, updateActions, onSaveProfile, onSignOut)
             }
             Spacer(Modifier.height(24.dp))
         }
@@ -168,8 +196,111 @@ private fun MainShell(
 }
 
 @Composable
+private fun UpdateBanner(state: UpdateUiState) {
+    val (text, progress) = when (state) {
+        is UpdateUiState.Downloading -> "Downloading Callio ${state.info.versionName}… ${state.percent}%" to state.percent / 100f
+        is UpdateUiState.Installing -> "Installing Callio ${state.info.versionName}…" to null
+        else -> return
+    }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2B2340)), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(13.dp)) {
+            Text(text, color = Lavender, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            if (progress != null) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth(), color = Lavender)
+            else LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Lavender)
+        }
+    }
+    Spacer(Modifier.height(14.dp))
+}
+
+@Composable
+private fun UpdateDialog(state: UpdateUiState, actions: UpdateUiActions) {
+    when (state) {
+        is UpdateUiState.Available -> {
+            val later: (@Composable () -> Unit)? = if (state.forced) null else ({
+                TextButton(onClick = actions.onDismiss) { Text("Later", color = Muted) }
+            })
+            AlertDialog(
+                onDismissRequest = { if (!state.forced) actions.onDismiss() },
+                containerColor = Panel2,
+                title = { Text(if (state.major) "Major update available" else "Update available", color = Color.White, fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("Callio ${state.info.versionName}", color = Lavender, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(8.dp))
+                        Text(state.info.notes.ifBlank { "Improvements and bug fixes." }, color = Muted, fontSize = 13.sp)
+                        if (state.forced) {
+                            Spacer(Modifier.height(10.dp))
+                            Text("This update is required to keep using Callio.", color = Danger, fontSize = 12.sp)
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = actions.onUpdateNow) { Text("Update now", color = Lavender, fontWeight = FontWeight.Bold) } },
+                dismissButton = later
+            )
+        }
+        is UpdateUiState.NeedsPermission -> AlertDialog(
+            onDismissRequest = actions.onDismiss,
+            containerColor = Panel2,
+            title = { Text("Allow Callio to update itself", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = { Text("Turn on “Allow from this source” for Callio once. Future updates will then install smoothly.", color = Muted, fontSize = 13.sp) },
+            confirmButton = { TextButton(onClick = actions.onOpenInstallSettings) { Text("Open settings", color = Lavender, fontWeight = FontWeight.Bold) } },
+            dismissButton = { TextButton(onClick = actions.onDismiss) { Text("Not now", color = Muted) } }
+        )
+        else -> Unit
+    }
+}
+
+@Composable
+private fun CallsTab(history: List<CallHistoryItem>, onCallBack: (CallHistoryItem) -> Unit) {
+    Text("Recent calls", color = Color.White, fontSize = 29.sp, fontWeight = FontWeight.Bold)
+    Text("Your audio call history.", color = Muted, fontSize = 13.sp)
+    Spacer(Modifier.height(20.dp))
+    if (history.isEmpty()) EmptyCard("No calls yet", "Calls you make and receive will show up here.")
+    else history.forEach { CallHistoryRow(it, onCallBack) }
+}
+
+@Composable
+private fun CallHistoryRow(item: CallHistoryItem, onCallBack: (CallHistoryItem) -> Unit) {
+    val missedIncoming = !item.outgoing && (item.status == "missed" || (item.status == "ended" && item.durationSeconds == 0L))
+    val failed = item.status == "failed"
+    val icon = when { item.outgoing -> Icons.Default.CallMade; missedIncoming -> Icons.Default.CallMissed; else -> Icons.Default.CallReceived }
+    val tint = if (missedIncoming || failed) Danger else if (item.outgoing) Lavender else Mint
+    val detail = when {
+        item.status == "ended" && item.durationSeconds > 0 -> "${item.durationSeconds / 60}m ${item.durationSeconds % 60}s"
+        missedIncoming -> "Missed"
+        item.status == "missed" -> "No answer"
+        item.status == "rejected" -> if (item.outgoing) "Declined" else "You declined"
+        failed -> "Couldn't connect"
+        else -> "Cancelled"
+    }
+    val whenText = android.text.format.DateUtils.getRelativeTimeSpanString(
+        item.createdAtMillis, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS
+    ).toString()
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(19.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 9.dp)) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Avatar(initialOf(item.personName), size = 44)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(item.personName, color = if (missedIncoming) Danger else Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    androidx.compose.material3.Icon(icon, null, tint = tint, modifier = Modifier.size(13.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("$detail · $whenText", color = Muted, fontSize = 11.sp)
+                }
+            }
+            Button(
+                onClick = { onCallBack(item) }, colors = ButtonDefaults.buttonColors(containerColor = Violet),
+                shape = CircleShape, modifier = Modifier.size(42.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+            ) { androidx.compose.material3.Icon(Icons.Default.Call, contentDescription = "Call back", tint = Color.White, modifier = Modifier.size(19.dp)) }
+        }
+    }
+}
+
+@Composable
 private fun HomeTab(
-    user: FirebaseUser, friends: List<CallioFriend>, requests: List<Pair<String, String>>,
+    user: FirebaseUser, friends: List<CallioFriend>, requests: List<FriendRequestItem>,
     onCall: (CallioFriend) -> Unit, onAcceptRequest: (String) -> Unit, onGoFriends: () -> Unit
 ) {
     val firstName = user.displayName?.substringBefore(" ")?.ifBlank { "there" } ?: "there"
@@ -225,9 +356,7 @@ private fun HomeTab(
     if (requests.isNotEmpty()) {
         Spacer(Modifier.height(20.dp))
         Text("Friend requests · ${requests.size}", color = Lavender, fontWeight = FontWeight.SemiBold)
-        requests.take(2).forEach { (id, fromUid) ->
-            RequestRow(id, fromUid, onAcceptRequest)
-        }
+        requests.take(2).forEach { RequestRow(it, onAcceptRequest) }
     }
 }
 
@@ -259,20 +388,21 @@ private fun FriendsTab(friends: List<CallioFriend>, onCall: (CallioFriend) -> Un
 }
 
 @Composable
-private fun RequestsTab(requests: List<Pair<String, String>>, onAcceptRequest: (String) -> Unit) {
+private fun RequestsTab(requests: List<FriendRequestItem>, onAcceptRequest: (String) -> Unit) {
     Text("Friend requests", color = Color.White, fontSize = 29.sp, fontWeight = FontWeight.Bold)
     Text("People who want to join your circle.", color = Muted, fontSize = 13.sp)
     Spacer(Modifier.height(20.dp))
     if (requests.isEmpty()) {
         EmptyCard("All caught up", "New friend requests will appear here.")
     } else {
-        requests.forEach { (id, fromUid) -> RequestRow(id, fromUid, onAcceptRequest) }
+        requests.forEach { RequestRow(it, onAcceptRequest) }
     }
 }
 
 @Composable
 private fun ProfileTab(
     user: FirebaseUser, savedDisplayName: String, savedUsername: String,
+    versionName: String, updateState: UpdateUiState, updateActions: UpdateUiActions,
     onSaveProfile: (String, String) -> Unit, onSignOut: () -> Unit
 ) {
     var username by remember(user.uid, savedUsername) { mutableStateOf(savedUsername) }
@@ -296,7 +426,39 @@ private fun ProfileTab(
             PrimaryButton("Save profile") { onSaveProfile(displayName, username) }
         }
     }
-    Spacer(Modifier.height(18.dp))
+    Spacer(Modifier.height(16.dp))
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth().padding(20.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(40.dp).clip(RoundedCornerShape(13.dp)).background(Panel2), contentAlignment = Alignment.Center) {
+                    androidx.compose.material3.Icon(Icons.Default.SystemUpdate, null, tint = Lavender, modifier = Modifier.size(22.dp))
+                }
+                Spacer(Modifier.width(12.dp))
+                Column {
+                    Text("App updates", color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text("Version $versionName", color = Muted, fontSize = 12.sp)
+                }
+            }
+            val (status, statusColor) = when (updateState) {
+                UpdateUiState.Checking -> "Checking for updates…" to Muted
+                UpdateUiState.UpToDate -> "You’re on the latest version ✓" to Mint
+                is UpdateUiState.Downloading -> "Downloading… ${updateState.percent}%" to Lavender
+                is UpdateUiState.Installing -> "Installing…" to Lavender
+                is UpdateUiState.Available -> "Version ${updateState.info.versionName} is available" to Lavender
+                is UpdateUiState.Error -> updateState.message to Danger
+                else -> "" to Muted
+            }
+            if (status.isNotBlank()) { Spacer(Modifier.height(12.dp)); Text(status, color = statusColor, fontSize = 12.sp) }
+            Spacer(Modifier.height(14.dp))
+            val busy = updateState is UpdateUiState.Checking || updateState is UpdateUiState.Downloading || updateState is UpdateUiState.Installing
+            Button(
+                onClick = updateActions.onCheck, enabled = !busy,
+                modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(15.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Panel2, contentColor = Lavender)
+            ) { Text("Check for updates", fontWeight = FontWeight.Bold) }
+        }
+    }
+    Spacer(Modifier.height(10.dp))
     TextButton(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) {
         Text("Sign out", color = Danger, fontWeight = FontWeight.SemiBold)
     }
@@ -325,16 +487,16 @@ private fun AddFriendField(onSearchAndAdd: (String) -> Unit) {
 }
 
 @Composable
-private fun RequestRow(id: String, fromUid: String, onAcceptRequest: (String) -> Unit) {
+private fun RequestRow(item: FriendRequestItem, onAcceptRequest: (String) -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(17.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Avatar(initialOf(fromUid), size = 42)
+            Avatar(initialOf(item.fromName), size = 42)
             Spacer(Modifier.width(11.dp))
             Column(Modifier.weight(1f)) {
-                Text("Callio member", color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text("ID ${fromUid.take(8)}", color = Muted, fontSize = 10.sp)
+                Text(item.fromName, color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text(if (item.fromUsername.isBlank()) "Wants to be friends" else "@${item.fromUsername}", color = Muted, fontSize = 11.sp)
             }
-            Button(onClick = { onAcceptRequest(id) }, colors = ButtonDefaults.buttonColors(containerColor = Violet), shape = RoundedCornerShape(13.dp)) {
+            Button(onClick = { onAcceptRequest(item.id) }, colors = ButtonDefaults.buttonColors(containerColor = Violet), shape = RoundedCornerShape(13.dp)) {
                 androidx.compose.material3.Icon(Icons.Default.Check, contentDescription = "Accept")
                 Spacer(Modifier.width(5.dp)); Text("Accept")
             }
@@ -438,7 +600,14 @@ private fun IncomingScreen(call: IncomingCall, onAccept: () -> Unit, onReject: (
 }
 
 @Composable
-private fun ActiveCallScreen(person: String, state: String, muted: Boolean, speaker: Boolean, onMute: () -> Unit, onSpeaker: () -> Unit, onEnd: () -> Unit) {
+private fun ActiveCallScreen(person: String, state: String, connectedAt: Long, muted: Boolean, speaker: Boolean, onMute: () -> Unit, onSpeaker: () -> Unit, onEnd: () -> Unit) {
+    var elapsed by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(state, connectedAt) {
+        while (state == "connected" && connectedAt > 0L) {
+            elapsed = (System.currentTimeMillis() - connectedAt) / 1000L
+            delay(1000)
+        }
+    }
     Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF292044), Ink, Ink))), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(26.dp)) {
             BrandMark()
@@ -446,7 +615,15 @@ private fun ActiveCallScreen(person: String, state: String, muted: Boolean, spea
             Avatar(initialOf(person), 122)
             Spacer(Modifier.height(25.dp))
             Text(person, color = Color.White, fontSize = 29.sp, fontWeight = FontWeight.Bold)
-            Text(when (state) { "connected" -> "Connected · Audio call"; "ringing" -> "Calling…"; "reconnecting" -> "Reconnecting…"; else -> "Connecting…" }, color = if (state == "connected") Mint else Muted)
+            Text(
+                when (state) {
+                    "connected" -> "Connected · ${"%02d:%02d".format(elapsed / 60, elapsed % 60)}"
+                    "ringing" -> "Ringing…"
+                    "reconnecting" -> "Reconnecting…"
+                    else -> "Connecting…"
+                },
+                color = if (state == "connected") Mint else Muted
+            )
             if (state == "reconnecting") { Spacer(Modifier.height(18.dp)); CircularProgressIndicator(color = Lavender) }
             Spacer(Modifier.height(92.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
