@@ -8,6 +8,10 @@ plugins {
 val callioServerUrl = (project.findProperty("CALLIO_SERVER_URL") as String?) ?: "https://YOUR-CALLIO-VERCEL-DOMAIN.vercel.app"
 val turnUrl = (project.findProperty("CALLIO_TURN_URL") as String?) ?: ""
 val turnUsername = (project.findProperty("CALLIO_TURN_USERNAME") as String?) ?: ""
+val updateUrl = (project.findProperty("CALLIO_UPDATE_URL") as String?) ?: ""
+val appVersionCode = (project.findProperty("APP_VERSION_CODE") as String?)?.toIntOrNull() ?: 1
+val appVersionName = (project.findProperty("APP_VERSION_NAME") as String?) ?: "1.0.0"
+val keystorePath: String? = System.getenv("CALLIO_KEYSTORE_PATH")?.takeIf { it.isNotBlank() && file(it).exists() }
 val turnCredential = (project.findProperty("CALLIO_TURN_CREDENTIAL") as String?) ?: ""
 
 android {
@@ -18,12 +22,36 @@ android {
         applicationId = "com.callio.app"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         buildConfigField("String", "CALLIO_SERVER_URL", "\"$callioServerUrl\"")
         buildConfigField("String", "CALLIO_TURN_URL", "\"$turnUrl\"")
         buildConfigField("String", "CALLIO_TURN_USERNAME", "\"$turnUsername\"")
         buildConfigField("String", "CALLIO_TURN_CREDENTIAL", "\"$turnCredential\"")
+        buildConfigField("String", "CALLIO_UPDATE_URL", "\"$updateUrl\"")
+    }
+
+    // One stable signing key is REQUIRED for in-app updates: Android refuses to update an app
+    // with an APK signed by a different key. The key is decrypted from the repo in CI (see RELEASE-SETUP-HI.md).
+    signingConfigs {
+        if (keystorePath != null) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("CALLIO_KEYSTORE_PASSWORD")
+                keyAlias = "callio"
+                keyPassword = System.getenv("CALLIO_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            if (keystorePath != null) signingConfig = signingConfigs.getByName("release")
+        }
+        debug {
+            if (keystorePath != null) signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     buildFeatures { compose = true; buildConfig = true }
