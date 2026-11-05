@@ -248,7 +248,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun endCallAudio() {
-        focusRequest?.let { audioManager.abandonAudioFocus(it) }
+        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
         focusRequest = null
         audioManager.mode = AudioManager.MODE_NORMAL
         audioManager.isSpeakerphoneOn = false
