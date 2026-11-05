@@ -1,0 +1,95 @@
+name: 2 - Release signed APK (OTA)
+on:
+  workflow_dispatch:
+    inputs:
+      update_type:
+        description: "minor = installs automatically in background, major = pop-up for users"
+        type: choice
+        options: [minor, major]
+        default: minor
+      notes:
+        description: "What's new (shown to users)"
+        required: false
+        default: "Improvements and bug fixes."
+      force_update:
+        description: "Force everyone on older versions to update before using the app"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check prerequisites
+        run: |
+          [ -f app/google-services.json ] || { echo "Missing app/google-services.json" >&2; exit 1; }
+          [ -f signing/callio-release.keystore.enc ] || { echo "Run workflow '1 - Generate signing key' first." >&2; exit 1; }
+          [ -n "$KEYSTORE_PASSWORD" ] || { echo "Secret KEYSTORE_PASSWORD is missing." >&2; exit 1; }
+
+      - name: Decrypt signing key
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in signing/callio-release.keystore.enc \
+            -out "$RUNNER_TEMP/callio.p12" -pass env:KEYSTORE_PASSWORD
+          echo "CALLIO_KEYSTORE_PATH=$RUNNER_TEMP/callio.p12" >> "$GITHUB_ENV"
+          echo "CALLIO_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compute version
+        run: |
+          echo "VERSION_CODE=$((GITHUB_RUN_NUMBER + 1))" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=1.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        run: |
+          gradle assembleRelease \
+            -PAPP_VERSION_CODE=$VERSION_CODE -PAPP_VERSION_NAME=$VERSION_NAME \
+            -PCALLIO_UPDATE_URL=https://github.com/${{ github.repository }}/releases/latest/download/version.json
+
+      - name: Verify signature
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | head -n 5
+          cp "$APK" "Callio-$VERSION_NAME.apk"
+
+      - name: Write version.json
+        env:
+          UPDATE_TYPE: ${{ inputs.update_type }}
+          NOTES: ${{ inputs.notes }}
+          FORCE: ${{ inputs.force_update }}
+        run: |
+          APK="Callio-$VERSION_NAME.apk"
+          PREV=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/version.json" || echo '{}')
+          PREV_MIN=$(echo "$PREV" | jq -r '.minSupportedVersionCode // 0')
+          PREV_MAJOR=$(echo "$PREV" | jq -r '.lastMajorVersionCode // 0')
+          MIN=$PREV_MIN; MAJOR=$PREV_MAJOR
+          [ "$UPDATE_TYPE" = "major" ] && MAJOR=$VERSION_CODE
+          [ "$FORCE" = "true" ] && MIN=$VERSION_CODE
+          jq -n \
+            --argjson code "$VERSION_CODE" --arg name "$VERSION_NAME" \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/v$VERSION_NAME/$APK" \
+            --arg sha "$(sha256sum "$APK" | cut -d' ' -f1)" --argjson size "$(stat -c%s "$APK")" \
+            --arg type "$UPDATE_TYPE" --argjson min "$MIN" --argjson major "$MAJOR" --arg notes "$NOTES" \
+            '{versionCode:$code,versionName:$name,apkUrl:$url,sha256:$sha,sizeBytes:$size,type:$type,minSupportedVersionCode:$min,lastMajorVersionCode:$major,notes:$notes}' > version.json
+          cat version.json
+
+      - name: Publish GitHub release
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          gh release create "v$VERSION_NAME" "Callio-$VERSION_NAME.apk" version.json \
+            --title "Callio $VERSION_NAME" --notes "$NOTES" --latest
